@@ -1,0 +1,622 @@
+---
+title: "Telecom Customer Churn — Predictive Modeling & Retention Strategy"
+author: "Adarsh Shukla"
+date: "2025"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(caret)
+library(ggplot2)
+library(pROC)
+library(e1071)
+library(MASS)
+library(naivebayes)
+library(rpart)
+library(rpart.plot)
+```
+
+---
+
+## Business Context
+
+Telecom companies routinely lose 25–30% of their customer base annually. 
+Every churned customer represents lost recurring revenue plus the cost of 
+acquiring a replacement — typically 5–7x more expensive than retention.
+
+Two questions drive this analysis:
+
+1. Which customers are most likely to leave — and how confident is the model?
+2. What is the financial case for intervening, and what does intervention cost?
+
+The dataset contains 6,499 customer records across 17 features — contract 
+type, tenure, service configuration, billing method, and churn status.
+
+---
+
+## Key Results
+
+Before the technical detail, here is what the analysis produced.
+
+**Model performance (Logistic Regression — best model):**
+
+- AUC: 0.8355
+- Accuracy at optimized threshold (0.6): 79.57%
+
+**Applied to 500 new customers:**
+
+| Metric | Value |
+|--------|-------|
+| Customers flagged as churn risk | 74 (14.8%) |
+| Monthly revenue at risk | $6,158 |
+| Proposed incentive cost | $2,220 ($30 per churner) |
+| Net benefit if churners retained | $3,938 |
+| ROI on incentive spend | 177% |
+
+**Loyalty program extension (internet customers only):**
+
+| Metric | Value |
+|--------|-------|
+| Eligible at-risk customers | 74 |
+| Cost per customer | $259.72 |
+| Net benefit per customer | $1,737.48 |
+| Total retained revenue | $147,793 |
+| Total net benefit | $128,574 |
+
+---
+
+## Churn Drivers
+
+Five factors emerged as the strongest predictors from logistic regression 
+odds ratios:
+
+| Factor | Direction | Odds Ratio |
+|--------|-----------|------------|
+| Fiber optic internet | Increases churn | 3.03x |
+| Month-to-month contract | Increases churn | Reference (highest risk) |
+| Electronic check payment | Increases churn | 1.42x |
+| Senior citizen | Increases churn | 1.36x |
+| Two-year contract | Decreases churn | 0.195x (80% less likely) |
+| Tenure (each month) | Decreases churn | 0.938x |
+| Online security | Decreases churn | 0.686x |
+
+**The single most actionable lever: contract type.** 
+Moving a month-to-month customer to a two-year contract 
+reduces their churn probability by 80%.
+
+---
+
+## Retention Strategy
+
+Three interventions ranked by expected ROI:
+
+**1. Contract conversion campaign**
+Target month-to-month customers with discounted annual contract offers. 
+It's the highest-volume segment and the strongest predictor — best place to start.
+
+**2. Early-tenure outreach**
+Customers in their first 12 months churn at disproportionately high rates. 
+Most early churners have already mentally left before anyone reaches out. Getting ahead of that window is the intervention.
+
+**3. Fiber optic service review**
+Fiber users are 3x more likely to churn despite paying premium prices. 
+Paying premium prices and leaving at twice the rate of DSL users, something is off, either on pricing or service delivery.
+
+---
+
+## Data Preparation
+
+#### 1. Load and Inspect Data
+
+```{r}
+load("Model_Building_Data.rda")
+str(Model_Building_Data)
+summary(Model_Building_Data)
+colSums(is.na(Model_Building_Data))
+```
+
+**Note:** 6,499 records, 17 features. TotalCharges has 11 missing values 
+from blank entries stored as character — handled below.
+
+#### 2. Clean and Type-Convert
+
+```{r}
+# TotalCharges stored as character with blanks — convert and remove NAs
+Model_Building_Data$TotalCharges <- as.numeric(as.character(Model_Building_Data$TotalCharges))
+Model_Building_Data <- na.omit(Model_Building_Data)
+
+# Convert character columns and SeniorCitizen to factors
+Model_Building_Data <- Model_Building_Data %>%
+  mutate(across(where(is.character), as.factor),
+         SeniorCitizen = as.factor(SeniorCitizen))
+```
+
+11 rows removed. Final dataset: 6,488 records, class balance maintained 
+(~73% retained, ~27% churned).
+
+---
+
+## Exploratory Analysis
+
+#### Churn Distribution
+
+```{r}
+ggplot(Model_Building_Data, aes(Status, fill = Status)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Current" = "#3B82F6", "Left" = "#EF4444")) +
+  labs(title = "Customer Churn Distribution", x = NULL, y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The dataset is imbalanced — ~73% retained, ~27% churned. 
+A naive model that always predicts 'retained' would already hit 73% accuracy — which is why threshold tuning matters here.
+
+#### Tenure vs Churn
+
+```{r}
+ggplot(Model_Building_Data, aes(x = Status, y = Tenure, fill = Status)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Current" = "#3B82F6", "Left" = "#EF4444")) +
+  labs(title = "Tenure Distribution by Churn Status",
+       x = NULL, y = "Tenure (months)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Churned customers have median tenure well below retained customers. 
+Month 1–12 is where most of the churn happens.
+
+#### Monthly Charges vs Churn
+
+```{r}
+ggplot(Model_Building_Data, aes(x = Status, y = MonthlyCharges, fill = Status)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Current" = "#3B82F6", "Left" = "#EF4444")) +
+  labs(title = "Monthly Charges by Churn Status",
+       x = NULL, y = "Monthly Charges ($)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Churned customers pay higher monthly charges on average — 
+paying more per month and leaving sooner go together.
+
+#### Contract Type
+
+```{r}
+ggplot(Model_Building_Data, aes(x = Contract, fill = Status)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Current" = "#3B82F6", "Left" = "#EF4444")) +
+  labs(title = "Churn Rate by Contract Type",
+       x = NULL, y = "Proportion") +
+  theme_minimal()
+```
+
+Month-to-month customers churn at dramatically higher rates. 
+Two-year contract holders barely churn at all.
+
+#### Internet Service
+
+```{r}
+ggplot(Model_Building_Data, aes(x = InternetService, fill = Status)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Current" = "#3B82F6", "Left" = "#EF4444")) +
+  labs(title = "Churn Rate by Internet Service Type",
+       x = NULL, y = "Proportion") +
+  theme_minimal()
+```
+
+Fiber optic customers churn at nearly double the rate of DSL customers — 
+despite paying more. That 3.03x odds ratio is the single largest in the model.
+
+#### Payment Method
+
+```{r}
+ggplot(Model_Building_Data, aes(x = PaymentMethod, fill = Status)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Current" = "#3B82F6", "Left" = "#EF4444")) +
+  labs(title = "Churn Rate by Payment Method",
+       x = NULL, y = "Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+Electronic check users churn at notably higher rates. 
+Customers on auto-pay — bank transfer or credit card — churn at noticeably lower rates.
+
+---
+
+## Train-Test Split
+
+```{r}
+set.seed(123)
+split <- createDataPartition(Model_Building_Data$Status, p = 0.8, list = FALSE)
+train_data <- Model_Building_Data[split, ]
+test_data  <- Model_Building_Data[-split, ]
+
+prop.table(table(train_data$Status))
+prop.table(table(test_data$Status))
+```
+
+80/20 stratified split. Class balance preserved in both subsets 
+(~73% Current / ~27% Left in each).
+
+---
+
+## Model Building
+
+Five models were built and evaluated on AUC and threshold-optimized accuracy. 
+Each model uses the same train/test split for fair comparison.
+
+### 5.1 Logistic Regression
+
+```{r}
+logit_model_full <- glm(Status ~ ., data = train_data, family = binomial)
+summary(logit_model_full)
+```
+
+```{r}
+test_probs <- predict(logit_model_full, newdata = test_data, type = "response")
+
+roc_logit <- roc(test_data$Status, test_probs)
+plot(roc_logit, col = "#2563EB", lwd = 2,
+     main = "ROC Curve — Logistic Regression")
+auc(roc_logit)
+```
+
+```{r}
+# Threshold tuning
+thresholds <- seq(0.1, 0.9, by = 0.1)
+accuracy <- sapply(thresholds, function(th) {
+  mean(ifelse(test_probs > th, "Left", "Current") == test_data$Status)
+})
+
+plot(thresholds, accuracy, type = "l", col = "#2563EB", lwd = 2,
+     xlab = "Threshold", ylab = "Accuracy",
+     main = "Threshold Tuning — Logistic Regression")
+
+best_thresh <- thresholds[which.max(accuracy)]
+cat("Best threshold:", best_thresh, "\n")
+cat("Best accuracy:", max(accuracy), "\n")
+```
+
+```{r}
+final_preds <- ifelse(test_probs > best_thresh, "Left", "Current")
+confusionMatrix(as.factor(final_preds), test_data$Status, positive = "Left")
+```
+
+```{r}
+# Odds ratios
+odds_ratios <- sort(exp(coef(logit_model_full)), decreasing = TRUE)
+odds_ratios
+```
+
+AUC: **0.8355** | Best accuracy: **79.57%** at threshold 0.6
+
+Fiber optic (3.03x), electronic check (1.42x), and senior citizen status (1.36x) 
+are the strongest positive churn predictors. 
+Two-year contracts (0.195x) are the strongest retention signal.
+
+---
+
+### 5.2 Naive Bayes
+
+```{r}
+nb_model <- naive_bayes(Status ~ ., data = train_data)
+nb_probs <- predict(nb_model, newdata = test_data, type = "prob")[, "Left"]
+
+nb_roc <- roc(test_data$Status, nb_probs)
+plot(nb_roc, col = "#7C3AED", lwd = 2,
+     main = "ROC Curve — Naive Bayes")
+auc(nb_roc)
+```
+
+```{r}
+nb_accuracy <- sapply(thresholds, function(th) {
+  mean(ifelse(nb_probs > th, "Left", "Current") == test_data$Status)
+})
+
+plot(thresholds, nb_accuracy, type = "l", col = "#7C3AED", lwd = 2,
+     xlab = "Threshold", ylab = "Accuracy",
+     main = "Threshold Tuning — Naive Bayes")
+
+nb_best_thresh <- thresholds[which.max(nb_accuracy)]
+cat("Best threshold:", nb_best_thresh, "\n")
+```
+
+```{r}
+nb_final_preds <- ifelse(nb_probs > nb_best_thresh, "Left", "Current")
+confusionMatrix(as.factor(nb_final_preds), test_data$Status, positive = "Left")
+```
+
+AUC: **0.8112** | Best accuracy: **77.10%** at threshold 0.9
+
+---
+
+### 5.3 Linear Discriminant Analysis (LDA)
+
+```{r}
+lda_model <- lda(Status ~ ., data = train_data)
+lda_pred  <- predict(lda_model, newdata = test_data)
+lda_probs <- lda_pred$posterior[, "Left"]
+
+lda_roc <- roc(test_data$Status, lda_probs)
+plot(lda_roc, col = "#F59E0B", lwd = 2,
+     main = "ROC Curve — LDA")
+auc(lda_roc)
+```
+
+```{r}
+lda_accuracy <- sapply(thresholds, function(th) {
+  mean(ifelse(lda_probs > th, "Left", "Current") == test_data$Status)
+})
+
+plot(thresholds, lda_accuracy, type = "l", col = "#F59E0B", lwd = 2,
+     xlab = "Threshold", ylab = "Accuracy",
+     main = "Threshold Tuning — LDA")
+
+lda_best_thresh <- thresholds[which.max(lda_accuracy)]
+cat("Best threshold:", lda_best_thresh, "\n")
+```
+
+```{r}
+lda_final_preds <- ifelse(lda_probs > lda_best_thresh, "Left", "Current")
+confusionMatrix(as.factor(lda_final_preds), test_data$Status, positive = "Left")
+```
+
+AUC: **0.8289** | Best accuracy: **79.11%** at threshold 0.6
+
+---
+
+### 5.4 Quadratic Discriminant Analysis (QDA)
+
+```{r}
+# Collapse "No internet/phone service" levels for QDA compatibility
+qda_train <- train_data
+qda_test  <- test_data
+
+cols_to_clean <- c("MultipleLines", "OnlineSecurity", "DeviceProtection", "StreamingMovies")
+for (col in cols_to_clean) {
+  for (df in c("qda_train", "qda_test")) {
+    temp <- get(df)
+    temp[[col]] <- as.character(temp[[col]])
+    temp[[col]][temp[[col]] %in% c("No internet service", "No phone service")] <- "No"
+    temp[[col]] <- as.factor(temp[[col]])
+    assign(df, temp)
+  }
+}
+
+qda_model <- qda(Status ~ ., data = qda_train)
+qda_pred  <- predict(qda_model, newdata = qda_test)
+qda_probs <- qda_pred$posterior[, "Left"]
+
+qda_roc <- roc(qda_test$Status, qda_probs)
+plot(qda_roc, col = "#EF4444", lwd = 2,
+     main = "ROC Curve — QDA")
+auc(qda_roc)
+```
+
+```{r}
+qda_accuracy <- sapply(thresholds, function(th) {
+  mean(ifelse(qda_probs > th, "Left", "Current") == qda_test$Status)
+})
+
+plot(thresholds, qda_accuracy, type = "l", col = "#EF4444", lwd = 2,
+     xlab = "Threshold", ylab = "Accuracy",
+     main = "Threshold Tuning — QDA")
+
+qda_best_thresh <- thresholds[which.max(qda_accuracy)]
+cat("Best threshold:", qda_best_thresh, "\n")
+```
+
+```{r}
+qda_final_preds <- ifelse(qda_probs > qda_best_thresh, "Left", "Current")
+confusionMatrix(as.factor(qda_final_preds), qda_test$Status, positive = "Left")
+```
+
+AUC: **0.8180** | Best accuracy: **78.10%** at threshold 0.9
+
+---
+
+### 5.5 Decision Tree (Pruned)
+
+```{r}
+tree_model <- rpart(Status ~ ., data = train_data, method = "class", cp = 0.001)
+printcp(tree_model)
+
+opt_cp <- tree_model$cptable[which.min(tree_model$cptable[, "xerror"]), "CP"]
+cat("Optimal cp:", opt_cp, "\n")
+```
+
+```{r}
+pruned_tree <- prune(tree_model, cp = opt_cp)
+
+par(mfrow = c(1, 2))
+rpart.plot(tree_model,  main = "Before Pruning", extra = 106)
+rpart.plot(pruned_tree, main = "After Pruning",  extra = 106)
+par(mfrow = c(1, 1))
+```
+
+```{r}
+tree_probs <- predict(pruned_tree, newdata = test_data, type = "prob")[, "Left"]
+
+tree_roc <- roc(test_data$Status, tree_probs)
+plot(tree_roc, col = "#10B981", lwd = 2,
+     main = "ROC Curve — Pruned Decision Tree")
+auc(tree_roc)
+```
+
+```{r}
+tree_accuracy <- sapply(thresholds, function(th) {
+  mean(ifelse(tree_probs > th, "Left", "Current") == test_data$Status)
+})
+
+plot(thresholds, tree_accuracy, type = "l", col = "#10B981", lwd = 2,
+     xlab = "Threshold", ylab = "Accuracy",
+     main = "Threshold Tuning — Decision Tree")
+
+tree_best_thresh <- thresholds[which.max(tree_accuracy)]
+cat("Best threshold:", tree_best_thresh, "\n")
+```
+
+```{r}
+tree_final_preds <- ifelse(tree_probs > tree_best_thresh, "Left", "Current")
+confusionMatrix(as.factor(tree_final_preds), test_data$Status, positive = "Left")
+```
+
+AUC: **0.8006** | Best accuracy: **78.95%** at threshold 0.5
+
+Pruning reduced the tree from a complex overfit structure to a 
+clean, interpretable model using Contract, InternetService, 
+Tenure, and PaymentMethod as the primary splits.
+
+---
+
+## Model Comparison
+
+```{r}
+auc_logit <- auc(roc(test_data$Status, test_probs))
+auc_nb    <- auc(roc(test_data$Status, nb_probs))
+auc_lda   <- auc(roc(test_data$Status, lda_probs))
+auc_qda   <- auc(roc(qda_test$Status, qda_probs))
+auc_tree  <- auc(roc(test_data$Status, tree_probs))
+
+acc_logit <- max(sapply(thresholds, function(th) mean(ifelse(test_probs  > th, "Left", "Current") == test_data$Status)))
+acc_nb    <- max(sapply(thresholds, function(th) mean(ifelse(nb_probs    > th, "Left", "Current") == test_data$Status)))
+acc_lda   <- max(sapply(thresholds, function(th) mean(ifelse(lda_probs   > th, "Left", "Current") == test_data$Status)))
+acc_qda   <- max(sapply(thresholds, function(th) mean(ifelse(qda_probs   > th, "Left", "Current") == qda_test$Status)))
+acc_tree  <- max(sapply(thresholds, function(th) mean(ifelse(tree_probs  > th, "Left", "Current") == test_data$Status)))
+
+comparison <- data.frame(
+  Model         = c("Logistic Regression", "LDA", "QDA", "Decision Tree", "Naive Bayes"),
+  AUC           = round(c(auc_logit, auc_lda, auc_qda, auc_tree, auc_nb), 4),
+  Best_Accuracy = round(c(acc_logit, acc_lda, acc_qda, acc_tree, acc_nb), 4),
+  Best_Threshold = c(0.6, 0.6, 0.9, 0.5, 0.9)
+)
+
+knitr::kable(comparison,
+             caption = "Model Comparison — AUC and Threshold-Optimized Accuracy",
+             col.names = c("Model", "AUC", "Best Accuracy", "Best Threshold"))
+```
+
+**Logistic regression is the recommended model.** It leads on both AUC 
+and accuracy, and its coefficients are directly interpretable as odds ratios — 
+and its coefficients read directly as odds ratios, which gives a retention team something concrete to act on.
+
+---
+
+## Business Application
+
+The logistic regression model was applied to a held-out implementation 
+dataset of 500 customers to simulate real deployment.
+
+#### Load and Prepare Implementation Data
+
+```{r}
+load("Implementation_Data.rda")
+
+Implementation_Data <- Implementation_Data %>%
+  mutate(across(where(is.character), as.factor),
+         SeniorCitizen = as.factor(SeniorCitizen))
+
+Implementation_Data$TotalCharges <- as.numeric(as.character(Implementation_Data$TotalCharges))
+Implementation_Data <- na.omit(Implementation_Data)
+```
+
+#### Score Customers
+
+```{r}
+impl_probs <- predict(logit_model_full, newdata = Implementation_Data, type = "response")
+impl_preds <- ifelse(impl_probs > best_thresh, "Left", "Current")
+
+Implementation_Data$PredictedStatus    <- impl_preds
+Implementation_Data$ChurnProbability   <- round(impl_probs, 4)
+```
+
+#### Revenue at Risk
+
+```{r}
+num_churn_risk  <- sum(Implementation_Data$PredictedStatus == "Left")
+revenue_at_risk <- sum(Implementation_Data$MonthlyCharges[Implementation_Data$PredictedStatus == "Left"])
+
+cat("Customers flagged as churn risk:", num_churn_risk, "\n")
+cat("Monthly revenue at risk: $", round(revenue_at_risk, 2), "\n")
+```
+
+#### Incentive Simulation
+
+```{r}
+discount_per_month <- 10
+discount_months    <- 3
+cost_per_churner   <- discount_per_month * discount_months
+
+total_incentive_cost <- num_churn_risk * cost_per_churner
+net_benefit          <- revenue_at_risk - total_incentive_cost
+roi                  <- (net_benefit / total_incentive_cost) * 100
+
+cat("Incentive cost per customer: $", cost_per_churner, "\n")
+cat("Total incentive spend: $", total_incentive_cost, "\n")
+cat("Revenue retained if successful: $", round(revenue_at_risk, 2), "\n")
+cat("Net benefit: $", round(net_benefit, 2), "\n")
+cat("ROI on incentive spend:", round(roi, 1), "%\n")
+```
+
+#### Loyalty Program (Internet Customers)
+
+```{r}
+churn_internet <- Implementation_Data %>%
+  filter(PredictedStatus == "Left", InternetService != "No")
+
+avg_monthly_bill    <- mean(churn_internet$MonthlyCharges)
+discount_24_months  <- 0.10 * avg_monthly_bill * 24
+addon_cost          <- 5 * 12
+cost_per_customer   <- discount_24_months + addon_cost
+retained_per_customer <- avg_monthly_bill * 24
+benefit_per_customer  <- retained_per_customer - cost_per_customer
+
+n_eligible            <- nrow(churn_internet)
+total_program_cost    <- cost_per_customer * n_eligible
+total_retained        <- retained_per_customer * n_eligible
+total_net_benefit     <- benefit_per_customer * n_eligible
+
+cat("Eligible customers:", n_eligible, "\n")
+cat("Avg monthly bill: $", round(avg_monthly_bill, 2), "\n")
+cat("Cost per customer: $", round(cost_per_customer, 2), "\n")
+cat("Net benefit per customer: $", round(benefit_per_customer, 2), "\n")
+cat("Total program cost: $", round(total_program_cost, 2), "\n")
+cat("Total retained revenue: $", round(total_retained, 2), "\n")
+cat("Total net benefit: $", round(total_net_benefit, 2), "\n")
+```
+
+---
+
+## Summary
+
+**Best model:** Logistic Regression — AUC 0.8355, accuracy 79.57% at threshold 0.6
+
+**Top churn drivers:**
+- Fiber optic internet (3.03x more likely to churn vs DSL)
+- Month-to-month contract (reference group — highest risk)
+- Electronic check payment (1.42x)
+- Two-year contract (0.195x — strongest retention signal)
+
+**Financial case for action (500 customers):**
+
+| Intervention | Cost | Revenue Protected | Net Benefit |
+|---|---|---|---|
+| Short incentive ($30/churner) | $2,220 | $6,158 | $3,938 |
+| Loyalty program (internet users) | $19,219 | $147,793 | $128,574 |
+
+Any CRM that takes a probability score can use this directly — flag customers above 0.6, trigger the outreach. The short incentive returns $1.77 for every dollar spent. The loyalty program returns $6.69.
