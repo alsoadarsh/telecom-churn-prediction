@@ -512,8 +512,7 @@ knitr::kable(comparison,
 ```
 
 **Logistic regression is the recommended model.** It leads on both AUC 
-and accuracy, and its coefficients are directly interpretable as odds ratios — 
-and its coefficients read directly as odds ratios, which gives a retention team something concrete to act on.
+and accuracy, its coefficients read directly as odds ratios, which gives a retention team something concrete to act on.
 
 ---
 
