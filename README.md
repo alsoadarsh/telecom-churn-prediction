@@ -158,4 +158,4 @@ R · tidyverse · ggplot2 · caret · pROC · MASS · naivebayes · rpart
 **Adarsh Shukla**
 MS Business Analytics · University of Dayton
 [LinkedIn](https://linkedin.com/in/adarshhshukla) ·
-[GitHub](https://github.com/alsoadarsh) .
+[GitHub](https://github.com/alsoadarsh)
